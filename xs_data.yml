@@ -1,0 +1,10 @@
+### DATA FOR DACE CROSS-SECTIONS
+
+# path to dace data (~ will be expanded to $HOME)
+dace_path: 'line_lists'
+
+# data for dace cross-sections
+# <irradiator name: [dace_name, MMW]>
+dace_data:
+  H2O:           ['1H2-16O_POKAZATEL', 18.0153]
+  CO:            ['12C-16O_HITEMP2019', 28.01]
