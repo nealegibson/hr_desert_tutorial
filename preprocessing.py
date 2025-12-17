@@ -86,3 +86,129 @@ def pca(X,N=1,mean_sub=True,norm_cols=False,add_bias=False,ret_eigenvals=False):
       
   if ret_eigenvals: return U,W,M+Xmean[...,None,:],d[...,:N]
   else: return U,W,M+Xmean[...,None,:]
+
+def sysrem(X,Xe,N=1,norm=False,tol=1e-5,mean_sub=True,max_iter=100,min_iter=5,add_bias=False,verbose=False):
+  """
+  Run SysRem on a 2D [time x wl] or 3D array [order x time x wl] or equivalent
+  
+  X - data
+  Xe - uncertainties (stdev)
+  N - number of passes of SysRem to run
+  tol - tolerance for convergence (in terms of delta chi2 of successive model fits)
+  mean_sub - performs weighted mean subtraction from each column if True. This should
+    always be set unless other average subtraction is performed
+  max_iter - maximum number of iterations
+  min_iter - minimum number of iterations
+  add_bias - add a bias vector to returned basis vectors U if True
+  verbose - print out diagnostic information
+  
+  U - basis vectors of shape [(order x) time x N] or [(order x) time x N+1] if add_bias
+  M - the SysRem model (after mean has been added back on)
+  
+  """
+  
+  assert X.shape==Xe.shape, ValueError("data and uncertainties arrays must be same shape")
+  
+  #create empty arrays for storage
+  U = np.zeros((*X.shape[:-1],N))
+  W = np.zeros([X.shape[0],X.shape[2],N] if X.ndim==3 else [X.shape[1],N])
+  M = np.zeros(X.shape)  
+  
+  #precompute the weights (1 / var) and get weighted mean over columns
+  L = 1. / Xe**2 #pre-compute the 1 / squared errors - ie weights
+  #replace any zero uncertainties - inf weights - with more sensible values
+  L[np.isinf(L)] = 0.
+
+  if mean_sub:
+    Xmean = np.sum(L*X,axis=-2) / np.sum(L,axis=-2)
+    Xmean[np.isnan(Xmean)] = 0. # reset nans to zero (caused by column of inf errors -> div by zero)
+  else: Xmean = np.zeros([X.shape[0],X.shape[-1]] if X.ndim==3 else [X.shape[-1],])
+  #create array of active residuals (weighted mean subtracted if set)
+  R = X - Xmean[...,None,:]
+  
+  #identify columns with all inf uncertainties or std=0. These should be removed from the algorithm
+  col_filt = np.all(np.isinf(Xe),axis=-2) + np.isclose(np.std(X,axis=-2),0)
+  col_filt = ~col_filt # set to True for good columns
+  
+  if X.ndim==2: #if X is 2D
+    for n in range(N): # loop over N passes of SysRem
+      if verbose: print('running pass {} of {}'.format(n,N))
+      u,w,m = sysrem_pass(R[...,col_filt]-M[...,col_filt],L[...,col_filt],tol=tol,norm=norm,max_iter=max_iter,min_iter=min_iter,verbose=verbose)      
+      M[...,col_filt] += m #add sysrem passes to model
+      U[:,n] = u #store basis vectors
+      W[:,n][col_filt] = w #store basis vectors
+  
+  elif X.ndim==3: #if X is 3D  
+    for order in range(X.shape[0]): # loop over each order
+      print("performing sysrem for order {}".format(order+1))    
+      for n in range(N): #loop over N passes of sysrem
+        if verbose: print('running pass {} of {}'.format(n,N))
+        u,w,m = sysrem_pass((R[order]-M[order])[...,col_filt[order]],L[order][...,col_filt[order]],tol=tol,norm=norm,max_iter=max_iter,min_iter=min_iter,verbose=verbose)
+        M[order][...,col_filt[order]] += m #add sysrem passes to model  
+        U[order,:,n] = u #store basis vectors
+        W[order,:,n][col_filt[order]] = w #store basis vectors
+
+  if add_bias and mean_sub: # add bias term to the U vector and W vector to account for mean subtraction
+    s = 1/np.sqrt(X.shape[-2]) # sqrt(1/N) required to make new vector normalised
+    U = np.concatenate([np.ones([*U.shape[:-1],1])*s  ,U],axis=-1) # this works for both 2D + 3D arrays
+    W = np.concatenate([Xmean[...,None]/s,W],axis=-1) # also rescale the W vectors to account for s
+  
+  return U,W,M + Xmean[...,None,:]
+
+def sysrem_pass(R,W,norm=False,tol=1e-5,max_iter=100,min_iter=5,verbose=False):
+  """
+  Run single pass of sysrem - returns the basis vector + model.
+  This takes in the inverse variance as the weights.
+  Should use sysrem function directly, which is a wrapper around this func.
+  
+  R - data to fit
+  W - weights, ie 1 / Re**2 (inverse variance)
+  norm - specify whether to normalise the vertical vector, so that diag(U.T @ U)=1
+    (SysRem does not guarantee U are orthonormal, like for PCA)
+  
+  """
+  
+  #initiate initial guess for 'optical state parameter'
+#  a = np.ones(R.shape[0]) # initiate as a const vector
+  a = np.random.normal(0,1,R.shape[0]) # initiate as a random vector
+  a = a / np.sqrt(np.dot(a,a)) # normalise the vector
+  
+  #calculate chi2
+  chi2_old = (W * R**2).sum()
+  
+  RW = R * W #can pre-multiply this as it takes a while
+  
+  #loop over iterations
+  for q in range(max_iter):
+    #get coefficients for each light curve
+    c = np.dot(a,RW) / np.dot(a**2,W) #much faster using matrix algebra
+    c[np.isnan(c)] = 0. #set any nans to zero - can happen where whole rows/columns have inf uncertainties
+    
+    #get 'airmass' for all light curves
+    a = np.dot(RW,c) / np.dot(W,c**2) #much faster using matrix algebra
+    if norm: a = a / np.sqrt(np.dot(a,a)) # force the vertical vector to be normalised
+    a[np.isnan(a)] = 0.
+
+    #calcalate the chi2 of the model fit - can ignore first few until min_iter is reached
+    if q > min_iter or verbose:
+      M = np.outer(a,c) # compute the current model
+      #get new residuals from fit
+      res_new = R - M
+      chi2_new = (W * res_new**2).sum() #calculate the chi2
+
+    if verbose: #print some diagnostic info
+      print(" sysrem_pass iteration {}: delta chi2 = {}".format(q,chi2_old - chi2_new))
+    
+    #break from the loop if converged
+    if q > min_iter and (chi2_old - chi2_new) < tol:
+      if verbose: print(' sysrem converged after {} iterations'.format(q))      
+      break
+            
+    #if the loop continues, store the new chi2 value as the old one
+    if q > min_iter or verbose: chi2_old = chi2_new
+
+  else:
+    print(' warning: sysrem didnt converge after {} iterations'.format(q+1))
+  
+  return a,c,M
+
